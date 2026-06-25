@@ -104,24 +104,65 @@ def disclosuresRaw(disclosureIndex: int = 538004, disclosureClass: str = None, d
         'companyId': companyId
     })
 
-def companyDisclosuresFromId(companyId: str, disclosureClass: str = None, disclosureType: str = None, disclosureIndex: int = 538004):
-    """Returns the disclosures for a company given a companyId"""
-    disclosures = []
-    current_index = disclosureIndex
-    prev_index = -1
-    while True:
-        raw = disclosuresRaw(companyId=companyId, disclosureClass=disclosureClass, disclosureType=disclosureType, disclosureIndex=current_index)
-        print(len(raw))
-        if len(raw) == 0: break
-        prev_index = current_index
-        current_index = raw[-1]['disclosureIndex']
-        print(current_index, latest_index, raw[-1])
-        if prev_index == current_index: break
-        disclosures.extend(raw)
-        if int(current_index) >= int(latest_index): break
+def companyDisclosuresFromId(
+    companyId: str,
+    disclosureClass: str = None,
+    disclosureType: str = None,
+    disclosureIndex: int = 538004,
+    page_size: int = 50,
+    pause: float = 0.0,
+) -> list[dict]:
+    """
+    Fetch ALL disclosures for one company, paging FORWARD from `disclosureIndex`.
 
-    with open('test.json', 'w') as f:
-        json.dump(disclosures, f)
+    /api/vyk/disclosures returns up to 50 records per call, ordered by
+    disclosureIndex ascending, starting at the index you pass (inclusive).
+    We walk forward by setting the next cursor to (max index on the page + 1)
+    and stop when a page comes back short (< page_size) or empty.
+
+    disclosureIndex starts at 538004 = the first KAP 4.0 disclosure. Records in
+    84196-538004 are pre-4.0 and are NOT served here, so the default 538004
+    means "from the very beginning of available history" (oldest -> newest).
+    """
+    disclosures: list[dict] = []
+    seen: set[int] = set()
+    cursor = int(disclosureIndex)
+
+    while True:
+        page = disclosuresRaw(
+            companyId=companyId,
+            disclosureClass=disclosureClass,
+            disclosureType=disclosureType,
+            disclosureIndex=cursor,
+        )
+        if not page:
+            break  # nothing left ahead for this company
+
+        new_in_page = 0
+        for rec in page:
+            idx = int(rec["disclosureIndex"])
+            if idx not in seen:
+                seen.add(idx)
+                disclosures.append(rec)
+                new_in_page += 1
+
+        last_idx = max(int(r["disclosureIndex"]) for r in page)
+
+        # guard against a server that ignores the cursor (prevents infinite loops)
+        if last_idx < cursor or new_in_page == 0:
+            break
+
+        cursor = last_idx + 1          # +1 avoids re-fetching the boundary record
+
+        if len(page) < page_size:      # short page == last page
+            break
+
+        # belt-and-braces: stop once we pass the global newest index
+        if latest_index and int(latest_index) > 0 and cursor > int(latest_index):
+            break
+
+        if pause:
+            time.sleep(pause)
 
     return disclosures
 
