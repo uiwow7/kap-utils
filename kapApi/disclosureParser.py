@@ -1,4 +1,4 @@
-import re, pandas as pd
+import re, pandas as pd, os, json
 
 def to_num(x):
     """Parse a number, falling back to European format (1.234.567,89 -> 1234567.89)."""
@@ -171,7 +171,9 @@ def deep(node, ctx, cur=None, cref=None):
         handle_value("", node, cur, cref, ctx)
 
 
-def detailToDataFrame(detail) -> pd.DataFrame:
+def detailToLongDataFrame(detail) -> pd.DataFrame:
+    """Parse a disclosure detail into a long ('tidy') table where each row is a
+    single fact: name, labels, the value and its reporting period/context."""
     global facts
     facts = []
     presentation = detail.get("presentation")
@@ -197,7 +199,51 @@ def detailToDataFrame(detail) -> pd.DataFrame:
             "currency", "rounding"]
     return pd.DataFrame(facts, columns=cols)
 
+
+def detailToDataFrame(detail) -> pd.DataFrame:
+    """Parse a disclosure detail into a wide table: one column per ``name`` and
+    one row per reporting ``period``, with ``value_num`` as the cell values.
+
+    Column order follows the order the names first appear in the document, and
+    row order follows the order the periods first appear. When the same
+    name/period pair occurs more than once (e.g. dimensional facts in the
+    statement of changes in equity) the last value encountered wins.
+    """
+    long = detailToLongDataFrame(detail)
+    if long.empty:
+        return pd.DataFrame()
+
+    # Preserve document order for both axes (pivot_table would otherwise sort).
+    name_order = list(dict.fromkeys(long["name"].tolist()))
+    period_order = list(dict.fromkeys(long["period"].tolist()))
+
+    wide = long.pivot_table(
+        index="period",
+        columns="name",
+        values="value_num",
+        aggfunc="last",
+    )
+    wide = wide.reindex(index=period_order, columns=name_order)
+    wide.index.name = "period"
+    wide.columns.name = None
+    return wide.reset_index()
+
+
 class Disclosure:
     def __init__(self, raw: dict):
         self.df = detailToDataFrame(raw)
+        self.long_df = detailToLongDataFrame(raw)
         self.data = raw
+
+    def save(self, fileType = 'csv'):
+        """Saves to the standard location of '/out/SYMBOL_ID/DISCLOSUREINDEX.csv'"""
+        if not os.path.exists('out'):
+            os.mkdir('out')
+
+        symbol = self.data['senderExchCodes'][0] or 'NUL'
+        path = f'out/{symbol}_{self.data['senderId']}/{self.data['disclosureIndex']}.{fileType}'
+        if fileType == 'csv':
+            self.df.to_csv(path, index=False, encoding='utf-8')
+        elif fileType == 'json':
+            with open(path, 'w') as f:
+                json.dump(self.data, f)

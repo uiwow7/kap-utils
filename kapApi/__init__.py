@@ -129,12 +129,19 @@ def companyDisclosuresFromId(
     cursor = int(disclosureIndex)
 
     while True:
-        page = disclosuresRaw(
-            companyId=companyId,
-            disclosureClass=disclosureClass,
-            disclosureType=disclosureType,
-            disclosureIndex=cursor,
-        )
+        try:
+            page = disclosuresRaw(
+                companyId=companyId,
+                disclosureClass=disclosureClass,
+                disclosureType=disclosureType,
+                disclosureIndex=cursor,
+            )
+        except RuntimeError as e:
+            # ER005 "Bildirim bulunamadı" = no disclosures at/after the cursor.
+            # This is how the feed signals end-of-data, so stop cleanly.
+            if "ER005" in str(e):
+                break
+            raise
         if not page:
             break  # nothing left ahead for this company
 
@@ -148,14 +155,14 @@ def companyDisclosuresFromId(
 
         last_idx = max(int(r["disclosureIndex"]) for r in page)
 
-        # guard against a server that ignores the cursor (prevents infinite loops)
+        # guard against a server that ignores the cursor (prevents infinite loops).
+        # NOTE: do NOT stop on a short page — this feed returns matches within a
+        # scan window, so pages are routinely < page_size yet more data follows.
+        # The only real end-of-data signal is ER005 (handled above).
         if last_idx < cursor or new_in_page == 0:
             break
 
         cursor = last_idx + 1          # +1 avoids re-fetching the boundary record
-
-        if len(page) < page_size:      # short page == last page
-            break
 
         # belt-and-braces: stop once we pass the global newest index
         if latest_index and int(latest_index) > 0 and cursor > int(latest_index):
@@ -182,7 +189,34 @@ def disclosureDetailRaw(disclosureIndex: int, fileType: str = 'data', subReportL
 def disclosureDetail(disclosureIndex: int, fileType: str = 'data', subReportList: str = None) -> Disclosure:
     """Returns a Disclosure object containing parsed data from the disclosure detail"""
     detail = disclosureDetailRaw(disclosureIndex, fileType, subReportList)
-    return Disclosure(detail)  
+    return Disclosure(detail)
+
+def combineDisclosures(disclosures: list[Disclosure]) -> pd.DataFrame:
+    """Combine a list of Disclosures into a single DataFrame.
+
+    Each Disclosure's wide table (one row per reporting period, one column per
+    line-item name) contributes its rows, tagged with the source
+    `disclosureIndex` and company `symbol` for provenance. Columns are the union
+    of all names seen across the disclosures, preserving first-appearance order;
+    a line item missing from a given disclosure is left as NaN for its rows.    
+    """
+    frames: list[pd.DataFrame] = []
+    for disc in disclosures:
+        df = disc.df
+        if df is None or df.empty:
+            continue
+        data = disc.data or {}
+        codes = data.get('senderExchCodes') or []
+        meta = pd.DataFrame({
+            'disclosureIndex': data.get('disclosureIndex'),
+            'symbol': codes[0] if codes else None,
+        }, index=df.index)
+        frames.append(pd.concat([meta, df], axis=1))
+
+    if not frames:
+        return pd.DataFrame()
+
+    return pd.concat(frames, ignore_index=True, sort=False)
 
 #endregion
 
