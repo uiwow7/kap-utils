@@ -62,10 +62,7 @@ NON_VALUE = {
     "id", "key", "contextRef", "context", "unitRef", "decimals", "code",
 }
 
-facts = []
-
-
-def handle_values(values_node, cur):
+def handle_values(values_node, cur, facts):
     """Handle a Values/Value structure where each Value carries its own
     contextId (the date), value, currency and rounding."""
     if not isinstance(values_node, dict):
@@ -102,7 +99,7 @@ def handle_values(values_node, cur):
         })
 
 
-def handle_value(key, v, cur, cref, ctx):
+def handle_value(key, v, cur, cref, ctx, facts):
     if v is None:
         return
     sv = str(v).strip()
@@ -137,7 +134,7 @@ def handle_value(key, v, cur, cref, ctx):
     })
 
 
-def deep(node, ctx, cur=None, cref=None):
+def deep(node, ctx, facts, cur=None, cref=None):
     if cur is None:
         cur = {"name": None, "tr": None, "en": None}
     if node is None:
@@ -155,26 +152,25 @@ def deep(node, ctx, cur=None, cref=None):
             if key in ("langs", "ContextList"):
                 continue
             if key == "Values":                 # <-- new structure
-                handle_values(child, cur)
+                handle_values(child, cur, facts)
                 continue
             if isinstance(child, (dict, list)):
-                deep(child, ctx, cur, cref)
+                deep(child, ctx, facts, cur, cref)
             else:
-                handle_value(key, child, cur, cref, ctx)
+                handle_value(key, child, cur, cref, ctx, facts)
     elif isinstance(node, list):
         for child in node:
             if isinstance(child, (dict, list)):
-                deep(child, ctx, cur, cref)
+                deep(child, ctx, facts, cur, cref)
             else:
-                handle_value("", child, cur, cref, ctx)
+                handle_value("", child, cur, cref, ctx, facts)
     else:
-        handle_value("", node, cur, cref, ctx)
+        handle_value("", node, cur, cref, ctx, facts)
 
 
 def detailToLongDataFrame(detail) -> pd.DataFrame:
     """Parse a disclosure detail into a long ('tidy') table where each row is a
     single fact: name, labels, the value and its reporting period/context."""
-    global facts
     facts = []
     presentation = detail.get("presentation")
     if isinstance(presentation, dict) and (
@@ -192,7 +188,7 @@ def detailToLongDataFrame(detail) -> pd.DataFrame:
         content = p.get("content") if isinstance(p, dict) else None
         ctx = context_map(content)
         if isinstance(content, dict):
-            deep(content.get("ReportItem"), ctx)
+            deep(content.get("ReportItem"), ctx, facts)
 
     cols = ["name", "label_tr", "label_en", "value_field",
             "value_raw", "value_num", "contextRef", "period",
