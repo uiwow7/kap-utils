@@ -109,7 +109,6 @@ def companyDisclosuresFromId(
     disclosureClass: str = None,
     disclosureType: str = None,
     disclosureIndex: int = 538004,
-    page_size: int = 50,
     pause: float = 0.0,
 ) -> list[dict]:
     """
@@ -170,6 +169,16 @@ def companyDisclosuresFromId(
 
         if pause:
             time.sleep(pause)
+
+    return disclosures
+
+def fundDisclosuresFromId(companyId: int, fundId: int, disclosureClass: str = None, disclosureType: str = None, disclosureIndex: int = 538004) -> list[Disclosure]:
+    """Returns all disclosures associated with a fundId"""
+    recs = companyDisclosuresFromId(companyId, disclosureClass, disclosureType, disclosureIndex)
+    disclosures = []
+    for rec in recs:
+        if rec.get('fundId') == fundId:
+            disclosures.append(disclosureDetail(rec['disclosureIndex']))
 
     return disclosures
 

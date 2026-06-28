@@ -222,7 +222,13 @@ def detailToDataFrame(detail) -> pd.DataFrame:
     wide = wide.reindex(index=period_order, columns=name_order)
     wide.index.name = "period"
     wide.columns.name = None
-    return wide.reset_index()
+    wide = wide.reset_index()
+
+    # Prepend the fund the disclosure was filed on behalf of (id, code, title).
+    wide.insert(0, "fundTitle", detail.get("behalfFundTitle"))
+    wide.insert(0, "fundCode", detail.get("behalfFundCode"))
+    wide.insert(0, "fundId", detail.get("behalfFundId"))
+    return wide
 
 
 class Disclosure:
