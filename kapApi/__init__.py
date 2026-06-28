@@ -1,4 +1,5 @@
 import requests, time, re, pandas as pd, json
+from requests.adapters import HTTPAdapter
 from kapApi.disclosureParser import Disclosure
 from kapApi.fundParser import Fund
 
@@ -6,6 +7,18 @@ BASE_URL: str = "https://kapdatafeed.kap.org.tr"
 api_key: str = ''
 token: str = ''
 latest_index: int = -1
+
+# Per-request timeout (seconds). Short so a throttled/hung call fails fast and
+# we back off, instead of blocking for a minute before retrying.
+REQUEST_TIMEOUT: float = 15
+
+# Shared session: reuses TCP/TLS connections across the thread pool instead of
+# doing a fresh handshake on every call. The pool is sized generously so many
+# concurrent workers don't contend for a single connection.
+session = requests.Session()
+_adapter = HTTPAdapter(pool_connections=32, pool_maxsize=32)
+session.mount("https://", _adapter)
+session.mount("http://", _adapter)
 
 # region setup
 def setup(apiKey: str) -> None:
@@ -16,15 +29,34 @@ def setup(apiKey: str) -> None:
     reloadLatestIndex()
 
 def kap_get(path: str, query: dict = None, tries: int = 4):
-    """GET a KAP endpoint with retries; raise on KAP error codes (ER/4xx/5xx)."""
+    """GET a KAP endpoint with retries; raise on KAP error codes (ER/4xx/5xx).
+
+    Retries on network errors and on throttling/5xx responses with exponential
+    backoff, so when KAP starts rate-limiting we ease off rather than hammer it.
+    """
     headers = None if token is None else {"Authorization": token}
     for k in range(1, tries + 1):
         try:
-            resp = requests.get(BASE_URL + path, headers=headers, params=query, timeout=60)
+            resp = session.get(
+                BASE_URL + path, headers=headers, params=query, timeout=REQUEST_TIMEOUT
+            )
         except requests.RequestException as e:
-            print(f"   retry {k}/{tries}: {e}")
-            time.sleep(2)
+            if k == tries:
+                raise RuntimeError(f"Network failed: {e}")
+            backoff = 2 ** (k - 1)        # 1s, 2s, 4s, ...
+            print(f"   retry {k}/{tries} ({e}); backing off {backoff}s")
+            time.sleep(backoff)
             continue
+
+        # Retry transient throttling / server errors instead of failing hard.
+        if resp.status_code in (429, 500, 502, 503, 504):
+            if k == tries:
+                raise RuntimeError(f"KAP HTTP {resp.status_code} after {tries} tries")
+            backoff = 2 ** (k - 1)
+            print(f"   retry {k}/{tries} (HTTP {resp.status_code}); backing off {backoff}s")
+            time.sleep(backoff)
+            continue
+
         try:
             out = resp.json()
         except ValueError:
