@@ -1,14 +1,13 @@
-import kapApi, os, pandas as pd
-from collections import defaultdict
+import kapApi, os, sys, glob, pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 kapApi.setup(os.environ['KAP_KEY'])
 
-# Cap the number of companies processed (handy for testing). Set to None for no cap.
-cap = 1
+# Cap the number of companies processed THIS run (handy for testing). None = no cap.
+cap = 5
 
-# Number of concurrent HTTP requests. The work is network-bound, so raising this
-# is the main speed knob; back it off if KAP starts throttling.
+# Concurrent HTTP requests used while fetching a single company's disclosures.
+# Companies themselves are processed one at a time (see the main loop).
 WORKERS = 3
 
 # Seconds to wait between paginated listing calls within a company, to avoid
@@ -22,12 +21,89 @@ DISCLOSURE_TYPE = 'FR'
 
 OUTPUT = 'all_companies.csv'
 
-# Directory for the per-company CSVs written before the combined file.
+# Directory holding one CSV per company. These persist across runs and are what
+# makes resuming + the final combine possible.
 OUTPUT_DIR = 'companies'
 
 
+def fetch_and_parse(idx):
+    """Fetch a disclosure detail and parse it into a Disclosure (thread-safe)."""
+    return kapApi.Disclosure(kapApi.disclosureDetailRaw(idx))
+
+
+def process_company(member):
+    """Fetch ALL of one company's balance sheets, combine, and write its CSV.
+
+    Returns the output path if a CSV was written, else None. Network failures on
+    individual disclosures are logged and skipped so one bad report can't sink
+    the whole company.
+    """
+    recs = kapApi.companyDisclosuresFromId(
+        member['id'],
+        disclosureClass=DISCLOSURE_CLASS,
+        disclosureType=DISCLOSURE_TYPE,
+        pause=PAGE_PAUSE,
+    )
+    indices = [rec['disclosureIndex'] for rec in recs]
+
+    discs = []
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        futures = {ex.submit(fetch_and_parse, idx): idx for idx in indices}
+        for fut in as_completed(futures):
+            idx = futures[fut]
+            try:
+                disc = fut.result()
+            except Exception as e:
+                print(f"    detail {idx} failed: {e}")
+                continue
+            # Keep only balance sheets: reports whose parsed table has 'Assets'.
+            if 'Assets' in disc.df.columns:
+                discs.append(disc)
+
+    if not discs:
+        return None
+
+    df = kapApi.combineDisclosures(discs)
+    if df.empty:
+        return None
+    df.insert(0, 'memberTitle', member.get('title'))
+    df.insert(0, 'memberId', member.get('id'))
+
+    path = os.path.join(OUTPUT_DIR, f"{member['id']}.csv")
+    df.to_csv(path, index=False, encoding='utf-8')
+    print(f"  wrote {path}: {df.shape[0]} rows")
+    return path
+
+
+def combine_csvs(output_dir, output):
+    """Concatenate every per-company CSV into one file by streaming them from
+    disk, so we never hold more than a single company's data in memory."""
+    files = sorted(glob.glob(os.path.join(output_dir, '*.csv')))
+    if not files:
+        print("No per-company CSVs to combine.")
+        return
+
+    # Pass 1: union of columns, preserving the order they first appear.
+    columns = []
+    seen_cols = set()
+    for f in files:
+        for c in pd.read_csv(f, nrows=0).columns:
+            if c not in seen_cols:
+                seen_cols.add(c)
+                columns.append(c)
+
+    # Pass 2: append each file's rows (aligned to the full column set) one by one.
+    rows = 0
+    with open(output, 'w', encoding='utf-8', newline='') as out:
+        for i, f in enumerate(files):
+            df = pd.read_csv(f).reindex(columns=columns)
+            df.to_csv(out, index=False, header=(i == 0))
+            rows += len(df)
+    print(f"Wrote {output}: {rows} rows x {len(columns)} cols from {len(files)} companies")
+
+
 # /members lists some companies more than once (e.g. multiple member types);
-# de-duplicate by id so we only fetch each company once.
+# de-duplicate by id so we only handle each company once, keeping a stable order.
 members = kapApi.members()
 seen: set = set()
 unique_members = []
@@ -38,105 +114,35 @@ for m in members:
     seen.add(mid)
     unique_members.append(m)
 
+# Resume support: pass the last successfully processed company id as argv[1] and
+# we continue with the NEXT company in the (stable) ordering.
+resume_after = sys.argv[1] if len(sys.argv) > 1 else None
+if resume_after is not None:
+    ids = [m['id'] for m in unique_members]
+    if resume_after in ids:
+        start = ids.index(resume_after) + 1
+        unique_members = unique_members[start:]
+        print(f"Resuming after company {resume_after}: {len(unique_members)} companies left.")
+    else:
+        print(f"Resume id {resume_after} not found; starting from the beginning.")
+
 if cap is not None:
     unique_members = unique_members[:cap]
 
-
-# Stage A: list each company's FR disclosures. Pagination within one company is
-# sequential (cursor-based), but companies are independent so we fan them out.
-def list_disclosures(member):
-    try:
-        recs = kapApi.companyDisclosuresFromId(
-            member['id'],
-            disclosureClass=DISCLOSURE_CLASS,
-            disclosureType=DISCLOSURE_TYPE,
-            pause=PAGE_PAUSE,
-        )
-    except Exception as e:
-        print(f"  list failed for {member.get('id')}: {e}")
-        return member, []
-    return member, recs
-
-
-print(f"Listing disclosures for {len(unique_members)} companies...")
-with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-    listed = list(ex.map(list_disclosures, unique_members))
-
-# Flatten to all disclosure indices, remembering which member each belongs to.
-member_by_index: dict = {}
-indices: list = []
-for member, recs in listed:
-    for rec in recs:
-        idx = rec['disclosureIndex']
-        member_by_index[idx] = member
-        indices.append(idx)
-
-# Stage B: fetch AND parse every disclosure detail concurrently. The parser is
-# thread-safe (it threads its facts list through the recursion), so each worker
-# does the full fetch+parse and just hands back a finished Disclosure.
-def fetch_and_parse(idx):
-    return kapApi.Disclosure(kapApi.disclosureDetailRaw(idx))
-
-
-# How many disclosures are still outstanding per company, so we know when a
-# company is fully fetched and can be written immediately.
-remaining: dict = defaultdict(int)
-for member, recs in listed:
-    remaining[member['id']] += len(recs)
-
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+# Main loop: one company fully fetched & written before moving to the next.
+for i, member in enumerate(unique_members, 1):
+    print(f"[{i}/{len(unique_members)}] {member.get('title')} ({member.get('id')})")
+    try:
+        process_company(member)
+    except Exception as e:
+        print(f"  company {member.get('id')} failed: {e}")
+        print(f"  -> resume with: python getHist.py {unique_members[i - 2]['id']}"
+              if i > 1 else "  -> resume from the beginning")
+        raise
+    # Last successfully processed id, so a crash/stop after this is resumable.
+    print(f"  done. resume token: {member.get('id')}")
 
-def finalize_company(member):
-    """Combine a company's balance sheets, save its CSV, and return the frame."""
-    discs = by_member.get(member['id'])
-    if not discs:
-        return None
-    df = kapApi.combineDisclosures(discs)
-    if df.empty:
-        return None
-    df.insert(0, 'memberTitle', member.get('title'))
-    df.insert(0, 'memberId', member.get('id'))
-
-    path = os.path.join(OUTPUT_DIR, f"{member.get('id')}.csv")
-    df.to_csv(path, index=False, encoding='utf-8')
-    print(f"  wrote {path}: {df.shape[0]} rows")
-    return df
-
-
-print(f"Fetching {len(indices)} disclosure details with {WORKERS} workers...")
-by_member: dict = defaultdict(list)  # member id -> list[Disclosure]
-frames = []
-done = 0
-with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-    futures = {ex.submit(fetch_and_parse, idx): idx for idx in indices}
-    for fut in as_completed(futures):
-        idx = futures[fut]
-        member = member_by_index[idx]
-        mid = member['id']
-        try:
-            disc = fut.result()
-        except Exception as e:
-            print(f"  detail {idx} failed: {e}")
-        else:
-            done += 1
-            if done % 50 == 0:
-                print(f"  {done}/{len(indices)}")
-            # Keep only balance sheets: reports whose parsed table has 'Assets'.
-            if 'Assets' in disc.df.columns:
-                by_member[mid].append(disc)
-
-        # This disclosure is accounted for; when it's the company's last one,
-        # combine and write that company's CSV right away.
-        remaining[mid] -= 1
-        if remaining[mid] == 0:
-            df = finalize_company(member)
-            if df is not None:
-                frames.append(df)
-
-if frames:
-    combined = pd.concat(frames, ignore_index=True, sort=False)
-    combined.to_csv(OUTPUT, index=False, encoding='utf-8')
-    print(f"Wrote {OUTPUT}: {combined.shape[0]} rows x {combined.shape[1]} cols")
-else:
-    print("No data collected.")
+# Final step: stitch the per-company CSVs (this run's and any prior runs') together.
+combine_csvs(OUTPUT_DIR, OUTPUT)
